@@ -1,0 +1,246 @@
+const express  = require("express");
+const bcrypt   = require("bcryptjs");
+const pool     = require("../config/db");
+const { authRequired }     = require("../middleware/auth");
+const { requirePermission } = require("../middleware/rbac");
+
+const router = express.Router();
+
+router.use(authRequired);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/users — list semua user aktif & nonaktif (admin)
+// ─────────────────────────────────────────────────────────────────────────────
+router.get("/", requirePermission("users.view"), async (_req, res, next) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT id, nama, email, role, departemen, nip, avatar, status, created_at,
+              (is_online = 1 AND last_seen_at IS NOT NULL
+                 AND last_seen_at >= DATE_SUB(NOW(), INTERVAL 45 SECOND)) AS is_online,
+              last_seen_at
+       FROM users
+       WHERE status != 'menunggu_approval'
+       ORDER BY created_at DESC`
+    );
+    res.json({ users: rows });
+  } catch (e) { next(e); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/users/pending — user yang menunggu approval
+// ─────────────────────────────────────────────────────────────────────────────
+router.get("/pending", requirePermission("users.approve"), async (_req, res, next) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT id, nama, email, role, departemen, nip, created_at
+       FROM users WHERE status = 'menunggu_approval' ORDER BY created_at DESC`
+    );
+    res.json({ users: rows });
+  } catch (e) { next(e); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/users — buat user baru 
+// ─────────────────────────────────────────────────────────────────────────────
+router.post("/", requirePermission("users.manage"), async (req, res, next) => {
+  let conn;
+  try {
+    const { nama, email, password, role, departemen, nip } = req.body;
+
+    if (!nama?.trim())  return res.status(400).json({ error: "Nama lengkap wajib diisi." });
+    if (!email?.trim()) return res.status(400).json({ error: "Email wajib diisi." });
+
+    const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!EMAIL_REGEX.test(email.trim())) {
+      return res.status(400).json({ error: "Format email tidak valid." });
+    }
+
+    const validRoles = ["Guru", "Kepala Sekolah", "Operator/TU"];
+    if (!role?.trim())            return res.status(400).json({ error: "Role wajib dipilih." });
+    if (!validRoles.includes(role)) return res.status(400).json({ error: "Role tidak valid." });
+    const userRole = role;
+
+    if (!departemen?.trim())     return res.status(400).json({ error: "Departemen wajib diisi." });
+
+    // Cek email unik
+    const [existing] = await pool.query("SELECT id FROM users WHERE email = ?", [email.trim()]);
+    if (existing.length) {
+      return res.status(409).json({ error: "Email sudah terdaftar." });
+    }
+
+    // Hash password — gunakan default jika tidak disediakan. Jika admin
+    // tidak mengisi password custom, akun ini memakai password default
+    // (Sakura@123) sehingga user WAJIB menggantinya saat login pertama.
+    const usingDefaultPassword = !password?.trim();
+    const rawPassword = password?.trim() || "Sakura@123";
+    const passwordHash = await bcrypt.hash(rawPassword, 10);
+
+    // users.id BUKAN AUTO_INCREMENT — hitung id berikutnya secara manual,
+    // dibungkus transaksi + FOR UPDATE supaya aman dari race condition.
+    conn = await pool.getConnection();
+    await conn.beginTransaction();
+
+    const [[row]] = await conn.query(
+      "SELECT COALESCE(MAX(id), 0) + 1 AS nextId FROM users FOR UPDATE"
+    );
+    const nextId = row.nextId;
+
+    await conn.query(
+      `INSERT INTO users (id, nama, email, password_hash, role, departemen, nip, status, must_change_password)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)`,
+      [
+        nextId,
+        nama.trim(),
+        email.trim().toLowerCase(),
+        passwordHash,
+        userRole,
+        departemen?.trim() || "",
+        nip?.trim() || "",
+        usingDefaultPassword ? 1 : 0,
+      ]
+    );
+
+    await conn.commit();
+
+    const [rows] = await pool.query(
+      "SELECT id, nama, email, role, departemen, nip, avatar, status, created_at FROM users WHERE id = ?",
+      [nextId]
+    );
+
+    res.status(201).json({ message: "User berhasil dibuat", user: rows[0] });
+  } catch (e) {
+    if (conn) await conn.rollback();
+    next(e);
+  } finally {
+    if (conn) conn.release();
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/users/:id/activate
+// ─────────────────────────────────────────────────────────────────────────────
+router.post("/:id/activate", requirePermission("users.approve"), async (req, res, next) => {
+  try {
+    const { role } = req.body || {};
+    await pool.query(
+      "UPDATE users SET status = 'active', role = COALESCE(?, role) WHERE id = ?",
+      [role || null, req.params.id]
+    );
+    res.json({ message: "User diaktifkan" });
+  } catch (e) { next(e); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DELETE /api/users/:id/reject — tolak registrasi
+// ─────────────────────────────────────────────────────────────────────────────
+router.delete("/:id/reject", requirePermission("users.approve"), async (req, res, next) => {
+  try {
+    await pool.query("DELETE FROM users WHERE id = ? AND status = 'menunggu_approval'", [req.params.id]);
+    res.json({ message: "Pendaftaran ditolak" });
+  } catch (e) { next(e); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DELETE /api/users/:id — hapus user permanent 
+// ─────────────────────────────────────────────────────────────────────────────
+router.delete("/:id", requirePermission("users.manage"), async (req, res, next) => {
+  try {
+    const targetId = Number(req.params.id);
+    if (targetId === req.user.id) {
+      return res.status(400).json({ error: "Tidak dapat menghapus akun sendiri" });
+    }
+
+    const [rows] = await pool.query("SELECT id, nama FROM users WHERE id = ?", [targetId]);
+    if (!rows.length) {
+      return res.status(404).json({ error: "User tidak ditemukan" });
+    }
+
+    await pool.query("DELETE FROM users WHERE id = ?", [targetId]);
+    res.json({ message: `User ${rows[0].nama} berhasil dihapus` });
+  } catch (e) { next(e); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PATCH /api/users/:id/role
+// ─────────────────────────────────────────────────────────────────────────────
+router.patch("/:id/role", requirePermission("users.manageRole"), async (req, res, next) => {
+  try {
+    const { role } = req.body;
+    if (!role) return res.status(400).json({ error: "role wajib diisi" });
+    await pool.query("UPDATE users SET role = ? WHERE id = ?", [role, req.params.id]);
+    res.json({ message: "Role diperbarui" });
+  } catch (e) { next(e); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PATCH /api/users/:id/avatar — user hanya boleh update avatar miliknya
+// ─────────────────────────────────────────────────────────────────────────────
+router.patch("/:id/avatar", async (req, res, next) => {
+  try {
+    if (Number(req.params.id) !== req.user.id) {
+      return res.status(403).json({ error: "Hanya bisa mengubah avatar sendiri" });
+    }
+    const { avatar } = req.body;
+    await pool.query("UPDATE users SET avatar = ? WHERE id = ?", [avatar || null, req.user.id]);
+    res.json({ message: "Avatar diperbarui" });
+  } catch (e) { next(e); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PATCH /api/users/:id — update profil 
+// ─────────────────────────────────────────────────────────────────────────────
+router.patch("/:id", async (req, res, next) => {
+  try {
+    const targetId = Number(req.params.id);
+    const isSelf = targetId === req.user.id;
+
+    if (!isSelf) {
+      // butuh permission users.manage
+      const [perm] = await pool.query(
+        `SELECT 1 FROM role_permissions rp JOIN permissions p ON p.permission_id = rp.permission_id
+         WHERE rp.role_name = ? AND p.permission_key = 'users.manage'`,
+        [req.user.role]
+      );
+      if (!perm.length) return res.status(403).json({ error: "Akses ditolak" });
+    }
+
+    const { nama, email, role, departemen, nip } = req.body;
+
+    if (email) {
+      const [existing] = await pool.query(
+        "SELECT id FROM users WHERE email = ? AND id != ?",
+        [email.trim().toLowerCase(), targetId]
+      );
+      if (existing.length) {
+        return res.status(409).json({ error: "Email sudah digunakan user lain" });
+      }
+    }
+
+    await pool.query(
+      `UPDATE users SET
+         nama       = COALESCE(?, nama),
+         email      = COALESCE(?, email),
+         role       = COALESCE(?, role),
+         departemen = COALESCE(?, departemen),
+         nip        = COALESCE(?, nip)
+       WHERE id = ?`,
+      [
+        nama?.trim()  || null,
+        email?.trim().toLowerCase() || null,
+        role          || null,
+        departemen?.trim() ?? null,
+        nip?.trim()   ?? null,
+        targetId,
+      ]
+    );
+
+    const [rows] = await pool.query(
+      "SELECT id, nama, email, role, departemen, nip, avatar, status, created_at FROM users WHERE id = ?",
+      [targetId]
+    );
+
+    res.json({ message: "User diperbarui", user: rows[0] });
+  } catch (e) { next(e); }
+});
+
+module.exports = router;
